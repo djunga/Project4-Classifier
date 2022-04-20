@@ -1,0 +1,207 @@
+---
+title: "Exploring a Spam-Ham Classifier"
+author: "Tora Mullings"
+date: "4/19/2022"
+output: html_document
+---
+## Overview
+Classification is an important branch of machine learning that involves categorizing items. A common example that's used to demonstrate classification is a ham-spam classifier, which attempts to differentiate spam emails from regular emails.
+
+Load libraries.
+```{r}
+library(tidyverse)
+library(tidytext)
+library(tidymodels)
+library(rvest)
+library(data.table)
+library(R.utils)
+library(tm)
+library(SnowballC)
+library(caTools)
+```
+
+
+Get corpus links by scraping [](https://spamassassin.apache.org/old/publiccorpus/).
+```{r}
+url <- "https://spamassassin.apache.org/old/publiccorpus/"
+links <- read_html(url) %>%
+            html_elements(xpath='//a') %>% 
+            html_attr("href")
+corpus_links <- links[6:14]
+```
+
+Download data into a temp directory.
+```{r}
+tmpdir <- tempdir()
+
+for (link in corpus_links) {
+  download.file(paste0(url,link), link)
+  unzipped <- bunzip2(link)
+  folder_name <- gsub("[.]tar","", unzipped)  # will be a subdirectory of the temp directory, tmpdir.
+  untar(unzipped, exdir=paste0(tmpdir,"\\",folder_name), compressed = 'gzip')
+}
+
+my_files <- list.files(tmpdir)
+my_files
+#unlink(tmpdir, recursive = TRUE, force=TRUE)
+```
+
+`get_parts` is a function for extracting body of email.
+```{r}
+
+get_parts <- function(email) {
+  
+  Encoding(email) <- "UTF-8"
+  email <- iconv(email, "UTF-8", "UTF-8",sub='')
+
+  parts = unlist(regmatches(email, regexpr("\n\n", email), invert = TRUE))   # splits into header and body
+
+  return (parts)
+}
+```
+
+
+```{r}
+
+makedf <- function(folder_path, email_tag) { # folder path: paste0(tmpdir,"\\20021010_easy_ham\\easy_ham\\0001.ea7e79d3153e7469e7a9c3e0af6a357e")
+  #folder_path:  paste0(tmpdir,"\\20021010_easy_ham\\easy_ham\\")
+  
+  
+  files.names <- list.files(folder_path) 
+  headers=c()
+  body=c()
+  tag=c()
+  
+  for (file.name in files.names) {
+    file.path <- paste0(folder_path,"\\",file.name)
+    file.content <- read_file(file.path)
+    email_parts <- get_parts(file.content)
+    
+    headers=c(headers, email_parts[1])
+    body=c(body, email_parts[2])
+    tag=c(tag, email_tag)
+  }
+  
+  
+  df <- data.frame(headers=headers, body=body, tag=tag)  # tag is either "ham" or "spam"
+  return (df)
+}
+```
+
+```{r}
+easyham1.df <- makedf(paste0(tmpdir,"\\20021010_easy_ham\\easy_ham\\"),"ham")
+easyham2.df <- makedf(paste0(tmpdir,"\\20030228_easy_ham\\easy_ham\\"),"ham")
+easyham3.df <- makedf(paste0(tmpdir,"\\20030228_easy_ham_2\\easy_ham_2\\"),"ham")
+```
+
+```{r}
+spam1.df <- makedf(paste0(tmpdir,"\\20021010_spam\\spam\\"), "spam") 
+spam2.df <- makedf(paste0(tmpdir,"\\20030228_spam\\spam\\"), "spam") 
+spam3.df <- makedf(paste0(tmpdir,"\\20030228_spam_2\\spam_2\\"), "spam") 
+spam4.df <- makedf(paste0(tmpdir,"\\20050311_spam_2\\spam_2\\"), "spam") 
+```
+
+```{r}
+ham_count = nrow(easyham1.df)+nrow(easyham2.df)+nrow(easyham3.df)  #6453
+spam_count = nrow(spam1.df)+nrow(spam2.df)+nrow(spam3.df)+nrow(spam4.df)  # 3797
+print(paste0("No. of ham emails: ", ham_count, ", No. spam emails: ", spam_count))
+```
+We can see that there are fewer spam emails than ham emails. Create an even data set, for balance.
+```{r}
+easyham.df <- rbind(easyham1.df, easyham2.df, easyham3.df)
+spam.df <- rbind(spam1.df,spam2.df,spam3.df,spam4.df)
+df <- rbind(easyham.df[1:spam_count, ], spam.df)
+
+set.seed(70)
+rows <- sample(nrow(df))
+df <- df[rows, ]
+```
+
+Now `df` is a data frame that contains all the emails, shuffled.
+Perform a series of cleaning steps of the text, including removing punctuation and numbers.
+```{r}
+df <- df %>% 
+  unite(email, c("headers","body"), sep="\n\n", remove=FALSE) # unite headers and body column into email column
+
+corpus <- Corpus(VectorSource(df[,c(1)]))
+
+corpus <- corpus %>% 
+    tm_map(PlainTextDocument)  %>%
+    tm_map(tolower) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(removeWords, c(stopwords("english"))) %>%
+    tm_map(removeNumbers) %>%
+    tm_map(stemDocument) %>%
+    tm_map(stripWhitespace)
+
+```
+
+
+Create document-term matrix, where each row represents an email and each column is a word that appears in an email. This can be a very sparse matrix, so remove the words that are very rare amongst all the emails.
+```{r}
+dtm.frequencies = DocumentTermMatrix(corpus)
+dtm.sparse = removeSparseTerms(dtm.frequencies, 0.995)
+df.sparse = as.data.frame(as.matrix(dtm.sparse))
+
+colnames(df.sparse) = make.names(colnames(df.sparse))
+
+df.sparse$tag = df$tag
+```
+
+
+```{r}
+split = sample.split(df.sparse$tag, SplitRatio = 0.7)
+
+train_set = subset(df.sparse, split==TRUE)
+
+test_set = subset(df.sparse, split==FALSE)
+```
+
+
+There are different types of models used for classification, like logistic regression and SVM. Here we use RandomForest.
+```{r}
+library(randomForest)
+
+
+train_set$tag = as.factor(train_set$tag)
+
+test_set$tag = as.factor(test_set$tag)
+
+
+RF_model = randomForest(tag ~ ., data=train_set)
+
+predictRF = predict(RF_model, newdata=test_set)
+
+table(test_set$tag, predictRF)
+```
+
+Evaluate accuracy.
+```{r}
+cm <- table(test_set$tag, predictRF)
+accuracy <- (cm[1]+cm[2,][2])/(sum(cm))
+print(paste0("Accuracy: ", accuracy))
+```
+
+
+## Conclusion
+Feature engineering is a large part of preparing to feed data to a classifier. It highly affects the prediction accuracy. 
+
+Let's review the series of feature engineering steps we took:
+
++ shuffling
++ transform to lowercase
++ remove punctuation, numbers, and stop-words
++ stemming
++ strip whitespace
+
+Even after cleaning the raw emails, the classifier only had a prediction accuracy slightly above 50%, which means that it's performance is hardly better than random guessing. This poor performance is likely due to either the wrong type of feature engineering or an unsuitable classifier. Perhaps an SVM classifier would have been better. 
+
+
+
+
+
+
+
+
+
+
